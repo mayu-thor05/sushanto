@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: flask-backend
+    env: python
+    plan: free
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "./start.sh"
+    envVars:
+      - key: PORT
+        value: 5000

@@ -1,0 +1,226 @@
+from flask import Blueprint, request, jsonify, send_file, current_app
+from docx import Document
+from io import BytesIO
+from utils.auth import get_user_from_token
+from pymongo import MongoClient
+import traceback
+import os
+from docx.oxml import parse_xml
+from docx.oxml.ns import nsdecls
+
+# Blueprint for Word document generation routes
+bp = Blueprint('word', __name__, url_prefix='/word')
+
+def get_db():
+    client = MongoClient(current_app.config["MONGODB_URI"])
+    return client.get_default_database()
+
+def replace_text(doc, placeholder, replacement):
+    """Replace placeholders throughout the document and log replacements."""
+    replacement_done = False
+
+    for paragraph in doc.paragraphs:
+        if placeholder in paragraph.text:
+            current_app.logger.debug(f"Replacing '{placeholder}' with '{replacement}' in paragraph: {paragraph.text}")
+            paragraph.text = paragraph.text.replace(placeholder, replacement)
+            replacement_done = True
+
+    for section in doc.sections:
+        header = section.header
+        if header:
+            for paragraph in header.paragraphs:
+                if placeholder in paragraph.text:
+                    current_app.logger.debug(f"Replacing '{placeholder}' with '{replacement}' in header paragraph: {paragraph.text}")
+                    paragraph.text = paragraph.text.replace(placeholder, replacement)
+                    replacement_done = True
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if placeholder in paragraph.text:
+                        current_app.logger.debug(f"Replacing '{placeholder}' with '{replacement}' in table cell: {paragraph.text}")
+                        paragraph.text = paragraph.text.replace(placeholder, replacement)
+                        replacement_done = True
+
+    if not replacement_done:
+        current_app.logger.warning(f"No occurrences of '{placeholder}' found in the document for replacement.")
+
+def replace_segments(doc, segments):
+    """Replace placeholders for segments and sub-segments in the document."""
+    for i, segment in enumerate(segments):
+        segment_key = f"{{{{Segment{i + 1}}}}}"
+        segment_name = segment.get("name", "")
+        current_app.logger.info(f"Replacing segment placeholder: {segment_key} with '{segment_name}'")
+        replace_text(doc, segment_key, segment_name)
+
+        sub_segments = segment.get("subSegments", [])
+        for j, subsegment in enumerate(sub_segments):
+            sub_key = f"{{{{Segment{i + 1}Sub-segment{j + 1}}}}}"
+            current_app.logger.info(f"Replacing sub-segment placeholder: {sub_key} with '{subsegment}'")
+            replace_text(doc, sub_key, subsegment)
+
+def replace_companies(doc, companies):
+    """Replace placeholders for company names in the document."""
+    for i, company in enumerate(companies[:10]):  # Limit to 10 companies
+        company_key = f"{{{{Company{i + 1}}}}}"
+        current_app.logger.info(f"Replacing company placeholder: {company_key} with '{company}'")
+        replace_text(doc, company_key, company)
+
+def clean_empty_segments(doc, user_inputs):
+    """
+    Removes paragraphs and table rows containing unprocessed placeholders 
+    for segments and sub-segments.
+    """
+    segment_placeholders = []
+
+    # Generate all possible placeholders for segments 1-6 and sub-segments 1-10
+    for i in range(1, 7):  # Segments 1-6
+        segment_placeholders.append(f"{{{{Segment{i}}}}}") 
+        # Also add variation with lowercase 's'
+        segment_placeholders.append(f"{{{{Segment{i}}}}}") 
+        for j in range(1, 11):  # Sub-Segments 1-10
+            # Add both variants of sub-segment formatting
+            segment_placeholders.append(f"{{{{Segment{i}Sub-Segment{j}}}}}")
+            segment_placeholders.append(f"{{{{Segment{i}Sub-segment{j}}}}}")
+
+    current_app.logger.info(f"Checking for these placeholders: {segment_placeholders}")
+
+    # Remove paragraphs containing unprocessed placeholders
+    paragraphs_to_remove = []  
+    for para in doc.paragraphs:
+        para_text = para.text.strip()
+        if not para_text:
+            continue
+        
+        current_app.logger.info(f"Processing paragraph: '{para_text}'")
+
+        # Check if any placeholder is still in the text
+        found_placeholders = [ph for ph in segment_placeholders if ph in para_text]
+        if found_placeholders:
+            current_app.logger.info(f"Found unprocessed placeholders in paragraph: {found_placeholders}")
+            current_app.logger.info(f"Marking paragraph for removal: '{para_text}'")
+            paragraphs_to_remove.append(para)
+
+    # Remove marked paragraphs
+    for para in paragraphs_to_remove:
+        p = para._element
+        p.getparent().remove(p)
+        current_app.logger.info(f"Removed paragraph: '{para.text.strip()}'")
+
+    # Remove table rows containing unprocessed placeholders
+    for table in doc.tables:
+        rows_to_remove = []  
+        for row in table.rows:
+            row_cells = [cell.text.strip() for cell in row.cells]
+            row_text = " | ".join(row_cells)
+            if not row_text.strip():
+                continue
+            
+            current_app.logger.info(f"Processing table row: '{row_text}'")
+
+            # Check each cell individually
+            found_placeholders = []
+            for cell in row.cells:
+                cell_text = " ".join([p.text.strip() for p in cell.paragraphs if p.text.strip()])
+                for placeholder in segment_placeholders:
+                    if placeholder in cell_text:
+                        found_placeholders.append(placeholder)
+                        current_app.logger.info(f"Found placeholder in cell: {placeholder}")
+
+            if found_placeholders:
+                current_app.logger.info(f"Found unprocessed placeholders in row: {found_placeholders}")
+                current_app.logger.info(f"Marking row for removal: '{row_text}'")
+                rows_to_remove.append(row)
+
+        # Remove marked rows
+        for row in rows_to_remove:
+            tr = row._element
+            tr.getparent().remove(tr)
+            current_app.logger.info(f"Removed table row with placeholders")
+
+    current_app.logger.info("Finished cleaning empty segments and table rows.")
+
+
+def log_placeholders(doc):
+    """Log all placeholders found in the document for debugging."""
+    for paragraph in doc.paragraphs:
+        current_app.logger.info(f"Paragraph text: {paragraph.text}")
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    current_app.logger.info(f"Table cell text: {paragraph.text}")
+
+@bp.route('/generate', methods=['POST'])
+def generate_word_doc():
+    """Generate a Word document based on template and input data."""
+    db = get_db()
+    documents_collection = db.documents
+    token = request.headers.get('Authorization')
+
+    if not token:
+        return jsonify({"message": "Token is required"}), 401
+
+    user = get_user_from_token(token)
+    if not user:
+        return jsonify({"message": "Invalid token"}), 401
+
+    data = request.get_json()
+    current_app.logger.info(f"Input data: {data}")
+    if not data:
+        current_app.logger.warning(f"User {user['username']} attempted to create a document without any data")
+        return jsonify({"message": "No data provided"}), 400
+
+    template_path = os.path.join(current_app.root_path, 'templates', 'template.docx')
+    if not os.path.exists(template_path):
+        current_app.logger.error(f"Template file not found when generating a document by user {user['username']}")
+        return jsonify({"message": "Template not found"}), 500
+
+    try:
+        # Load the template document
+        doc = Document(template_path)
+        log_placeholders(doc)
+
+        # Extract market_name
+        market_name = data.get("market_name", "")
+        if market_name:
+            replace_text(doc, "{{market_name}}", market_name)
+
+        # Convert flat dictionary to structured segmentations
+        segmentations = []
+        i = 1
+        while f"Segment{i}" in data:
+            segment_name = data[f"Segment{i}"]
+            sub_segments = []
+            j = 1
+            while f"Segment{i}Sub-segment{j}" in data:
+                sub_segments.append(data[f"Segment{i}Sub-segment{j}"])
+                j += 1
+            segmentations.append({"name": segment_name, "subSegments": sub_segments})
+            i += 1
+
+        current_app.logger.info(f"Converted segmentations: {segmentations}")
+
+        # Replace segments in the document
+        replace_segments(doc, segmentations)
+
+        print("Calling clean_empty_segments...")
+        # Clean empty paragraphs and table rows
+        clean_empty_segments(doc, segmentations)
+        
+        # Replace company names
+        companies = [data.get(f"Company{i+1}", "") for i in range(10)]
+        replace_companies(doc, companies)
+
+        # Save the updated document to an in-memory file
+        in_memory_file = BytesIO()
+        doc.save(in_memory_file)
+        in_memory_file.seek(0)
+
+        current_app.logger.info(f"Document generated successfully by user {user['username']}")
+        current_app.logger.info(f"Market Name: {market_name}")
+        return send_file(in_memory_file, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document", download_name= f'{market_name} Market.docx', as_attachment=True)
+    except Exception as e:
+        current_app.logger.error(f"Error generating document by user {user['username']}: {traceback.format_exc()}")
+        return jsonify({'message': 'Error generating document', 'error': str(e)}), 500

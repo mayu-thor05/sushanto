@@ -1,0 +1,179 @@
+from flask import Blueprint, request, jsonify, send_file, current_app
+from docx import Document
+from lxml import etree
+import os
+from io import BytesIO
+from utils.auth import get_user_from_token
+from pymongo import MongoClient
+import traceback
+
+# Create a blueprint for Word document generation routes
+bp = Blueprint('word', __name__, url_prefix='/word')
+
+def get_db():
+    client = MongoClient(current_app.config["MONGODB_URI"])
+    db = client.get_default_database()
+    return db
+
+def replace_market_name(doc, market_name):
+    current_app.logger.info(f"Replacing market name: {market_name}")
+    placeholder = "{{market_name}}"
+
+    # Replace in paragraphs
+    for paragraph in doc.paragraphs:
+        if placeholder in paragraph.text:
+            paragraph.text = paragraph.text.replace(placeholder, market_name)
+
+    # Replace in headers
+    for section in doc.sections:
+        header = section.header
+        if header:
+            for paragraph in header.paragraphs:
+                if placeholder in paragraph.text:
+                    paragraph.text = paragraph.text.replace(placeholder, market_name)
+
+    # Replace in tables
+    for table in doc.tables:
+        for row in table.rows:
+           for cell in row.cells:
+              for paragraph in cell.paragraphs:
+                 if placeholder in paragraph.text:
+                    paragraph.text = paragraph.text.replace(placeholder, market_name)
+
+
+# Replace in Shapes
+    for shape in doc.inline_shapes:
+        if shape.type == 13:  # msoPicture (Shape type for DrawingML objects)
+            try:
+               graphic_frame = shape._inline.graphicFrame
+               if graphic_frame is not None:
+                  graphic_data = graphic_frame.graphicData
+                  if graphic_data is not None:
+                    for t in graphic_data.xpath('.//a:t', namespaces={'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}):
+                      if placeholder in t.text:
+                            t.text = t.text.replace(placeholder, str(market_name))  # Correct the line
+            except Exception as e:
+                current_app.logger.error(f"Error processing shape: {e}")
+def replace_text(doc, placeholder, replacement):
+    """Replaces text placeholders throughout the document."""
+    for paragraph in doc.paragraphs:
+        if placeholder in paragraph.text:
+            for run in paragraph.runs:
+                if placeholder in run.text:
+                    run.text = run.text.replace(placeholder, replacement)
+    
+    for section in doc.sections:
+        if section.header:
+            for paragraph in section.header.paragraphs:
+                if placeholder in paragraph.text:
+                    paragraph.text = paragraph.text.replace(placeholder, replacement)
+    
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if placeholder in paragraph.text:
+                        paragraph.text = paragraph.text.replace(placeholder, replacement)
+
+def replace_segments(doc, segments):
+    """Replaces segment and sub-segment placeholders in the document."""
+    current_app.logger.info(f"Replacing segments: {segments}")
+    for i, segment in enumerate(segments):
+        segment_key = f"{{{{Segment{i + 1}}}}}"
+        if segment and isinstance(segment, dict):
+            segment_name = segment.get("name", "")
+            replace_text(doc, segment_key, segment_name)  # Updated line
+            current_app.logger.info(f"Replacing segment {segment_key} with {segment_name}")
+            if "subSegments" in segment:  
+                subsegments = segment.get("subSegments", []) 
+                for j, subsegment in enumerate(subsegments):
+                    sub_key = f"{{{{Segment{i + 1}Sub-segment{j + 1}}}}}"
+                    if subsegment and isinstance(subsegment, str):
+                        replace_text(doc, sub_key, subsegment)  # Updated line
+                        current_app.logger.info(f"Replacing subsegment {sub_key} with {subsegment}")
+        else:
+            current_app.logger.warning(f"Invalid segment data at index {i}: {segment}")
+
+
+def replace_segments_in_paragraphs(doc, segments):
+    """Replaces segment and sub-segment placeholders in paragraphs."""
+    current_app.logger.info(f"Replacing segments and subsegments in paragraphs: {segments}")
+    for i, segment_data in enumerate(segments):
+        segment_key = f"{{{{Segment{i + 1}}}}}"
+        subsegment_keys = [f"{{{{Segment{i + 1}Sub-segment{j + 1}}}}}" for j in range(10)]
+
+        segment_name = segment_data.get("name", "")
+        sub_segments = segment_data.get("subSegments", [])
+
+        replace_text(doc, segment_key, segment_name)  # Updated line
+
+        for j, subsegment in enumerate(sub_segments):
+            if subsegment:
+                replace_text(doc, subsegment_keys[j], subsegment)  # Updated line
+
+
+def replace_segments_in_tables(doc, segments):
+    """Replaces segment and sub-segment placeholders in tables."""
+    current_app.logger.info(f"Replacing segments and subsegments in tables: {segments}")
+    for table in doc.tables:
+        for i, segment_data in enumerate(segments):
+            segment_key = f"{{{{Segment{i + 1}}}}}"
+            subsegment_keys = [f"{{{{Segment{i + 1}Sub-segment{j + 1}}}}}" for j in range(10)]
+            segment_name = segment_data.get("name", "")
+            sub_segments = segment_data.get("subSegments", [])
+
+            for row in table.rows:
+                for cell in row.cells:
+                    replace_text(doc, segment_key, segment_name)  # Updated line
+                    for j, subsegment in enumerate(sub_segments):
+                        if subsegment:
+                            replace_text(doc, subsegment_keys[j], subsegment)  # Updated line
+
+    current_app.logger.info(f"Finished replacing market name")
+    return doc
+
+   
+@bp.route('/generate', methods=['POST'])
+def generate_word_doc():
+    db = get_db()
+    documents_collection = db.documents
+    token = request.headers.get('Authorization')
+    if not token:
+       return jsonify({"message": "Token is required"}), 401
+    user = get_user_from_token(token)
+    if not user:
+       return jsonify({"message": "Invalid token"}), 401
+
+    data = request.get_json()
+    print(data)
+    print(data.get("segmentations", []))
+    if not data:
+       current_app.logger.warning(f"User {user['username']} attempted to create a document without any data")
+       return jsonify({"message": "No data provided"}), 400
+    
+    current_path = os.path.dirname(os.path.abspath(__file__))
+    template_path = os.path.join(current_path, '..', 'templates', 'template.docx')
+    current_app.logger.info(f"Template path: {template_path}")
+    if not os.path.exists(template_path):
+        current_app.logger.error(f"Template file not found when generating a document by user {user['username']}")
+        return jsonify({"message": "Template not found"}), 500
+    try:
+        doc = Document(template_path)
+        current_app.logger.info(f"Template {template_path} loaded successfully")
+
+        replace_segments(doc, data.get("segmentations", []))  # Replaces all segments
+        replace_segments_in_paragraphs(doc, data.get("segmentations", []))  # Added this
+        replace_segments_in_tables(doc, data.get("segmentations", []))  # Added this
+
+        replace_market_name(doc, data.get("market_name", ""))
+
+        in_memory_file = BytesIO()
+        doc.save(in_memory_file)
+        in_memory_file.seek(0)
+
+        current_app.logger.info(f"Document generated successfully by user {user['username']}")
+        return send_file(in_memory_file, download_name='generated_document.docx', as_attachment=True)
+    except Exception as e:
+        tb_str = traceback.format_exception(e)
+        current_app.logger.error(f"Error generating document by user {user['username']}: {e}, Traceback: {tb_str}")
+        return jsonify({'message': 'Error generating document', 'error': str(e)}), 500
